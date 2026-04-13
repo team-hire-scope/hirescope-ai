@@ -1,145 +1,133 @@
 import json
 import logging
-from typing import Any, Dict
+from typing import Tuple
 
 from app.models.request import AnalysisRequest
-from app.models.response import ScoreCriteria, ScoreDetail
-from app.prompts.scoring_prompt import SCORING_SYSTEM_PROMPT, SCORING_USER_PROMPT_TEMPLATE
+from app.models.response import ScoreItem, ScoreDetail
+from app.prompts.scoring_prompt import SCORING_SYSTEM_PROMPT, build_user_prompt
 from app.services.llm_service import LLMService
 from app.services.rag_service import RAGService
 
 logger = logging.getLogger(__name__)
 
-# 5대 기준 가중치 (균등 20%)
-SCORE_WEIGHTS = {
-    "job_fit": 0.20,
-    "career_consistency": 0.20,
-    "skill_match": 0.20,
-    "quantitative_achievement": 0.20,
-    "document_quality": 0.20,
-}
 
+def _parse_score_response(raw: str) -> ScoreDetail:
+    """LLM 응답 JSON을 ScoreDetail 모델로 변환한다.
 
-def _format_careers(request: AnalysisRequest) -> str:
-    """경력 정보를 프롬프트용 텍스트로 변환."""
-    if not request.resume.careers:
-        return "경력 없음"
-    lines = []
-    for c in request.resume.careers:
-        end = c.end_date or "현재"
-        desc = f" — {c.description}" if c.description else ""
-        lines.append(f"- {c.company_name} | {c.position} ({c.start_date} ~ {end}){desc}")
-    return "\n".join(lines)
+    기대 JSON 구조:
+    {
+      "scores": {
+        "job_fit": {"score": ..., "reason": ...},
+        ...
+      }
+    }
 
+    Args:
+        raw: LLM 응답 텍스트 (JSON 펜스 제거 후)
 
-def _format_educations(request: AnalysisRequest) -> str:
-    """학력 정보를 프롬프트용 텍스트로 변환."""
-    if not request.resume.educations:
-        return "학력 정보 없음"
-    lines = []
-    for e in request.resume.educations:
-        major = f" / {e.major}" if e.major else ""
-        degree = f" ({e.degree})" if e.degree else ""
-        end = e.end_date or "재학 중"
-        lines.append(f"- {e.institution}{major}{degree} ({e.start_date} ~ {end})")
-    return "\n".join(lines)
+    Returns:
+        파싱된 ScoreDetail 모델
 
+    Raises:
+        ValueError: JSON 파싱 실패 또는 필드 누락 시
+    """
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"JSON 파싱 실패: {e}\n원본 응답:\n{raw}") from e
 
-def _format_projects(request: AnalysisRequest) -> str:
-    """프로젝트 정보를 프롬프트용 텍스트로 변환."""
-    if not request.resume.projects:
-        return "프로젝트 경험 없음"
-    lines = []
-    for p in request.resume.projects:
-        tech = f" [기술: {', '.join(p.tech_stack)}]" if p.tech_stack else ""
-        desc = f"\n  {p.description}" if p.description else ""
-        lines.append(f"- {p.name}{tech}{desc}")
-    return "\n".join(lines)
+    scores = data.get("scores", data)  # "scores" 키가 없으면 최상위에서 직접 파싱 시도
 
+    required_keys = {
+        "job_fit", "career_consistency", "skill_match",
+        "quantitative_achievement", "document_quality",
+    }
+    missing = required_keys - set(scores.keys())
+    if missing:
+        raise ValueError(f"점수 JSON에 필수 키 누락: {missing}\n원본:\n{raw}")
 
-def _format_certifications(request: AnalysisRequest) -> str:
-    """자격증 정보를 프롬프트용 텍스트로 변환."""
-    if not request.resume.certifications:
-        return "없음"
-    return ", ".join(
-        f"{c.name}({c.issuer or ''})" for c in request.resume.certifications
+    return ScoreDetail(
+        job_fit=ScoreItem(**scores["job_fit"]),
+        career_consistency=ScoreItem(**scores["career_consistency"]),
+        skill_match=ScoreItem(**scores["skill_match"]),
+        quantitative_achievement=ScoreItem(**scores["quantitative_achievement"]),
+        document_quality=ScoreItem(**scores["document_quality"]),
     )
 
 
-def _parse_score_response(raw: str) -> Dict[str, Any]:
-    """LLM 응답에서 JSON을 추출하여 파싱."""
-    raw = raw.strip()
-    # 코드 블록 제거
-    if "```json" in raw:
-        raw = raw.split("```json")[1].split("```")[0].strip()
-    elif "```" in raw:
-        raw = raw.split("```")[1].split("```")[0].strip()
-    return json.loads(raw)
-
-
 class ScoringService:
-    """5대 기준 점수 산정 서비스."""
+    """5대 기준 점수 산정 서비스.
+
+    llm_service와 rag_service를 주입받아 이력서+JD를 분석하고
+    5개 기준별 점수(ScoreDetail)와 단순 평균 총점을 반환한다.
+    JSON 파싱 실패 시 1회 재시도한다.
+    """
 
     def __init__(self, llm_service: LLMService, rag_service: RAGService) -> None:
         self._llm = llm_service
         self._rag = rag_service
 
-    async def score(self, request: AnalysisRequest) -> tuple[ScoreDetail, float]:
-        """이력서와 JD를 분석하여 5대 기준 점수 및 총점을 반환.
+    async def score(self, request: AnalysisRequest) -> Tuple[ScoreDetail, float]:
+        """이력서와 JD를 분석하여 5대 기준 점수 및 단순 평균 총점을 반환.
 
         Args:
             request: 분석 요청 데이터
 
         Returns:
-            (ScoreDetail, total_score) 튜플
+            (ScoreDetail, total_score) 튜플 — total_score는 5개 점수의 단순 평균
+
+        Raises:
+            ValueError: LLM 응답 파싱 2회 모두 실패 시
         """
         # RAG 컨텍스트 검색
         rag_results = await self._rag.search_similar(
             f"{request.job_posting.job_title} {' '.join(request.job_posting.required_skills)}"
         )
-        rag_context = ""
-        if rag_results:
-            rag_context = "\n## 유사 직무 참고 데이터\n" + "\n".join(
-                f"- {doc}" for doc in rag_results
-            )
+        rag_context = "\n".join(f"- {doc}" for doc in rag_results) if rag_results else ""
 
-        user_prompt = SCORING_USER_PROMPT_TEMPLATE.format(
-            company_name=request.job_posting.company_name,
-            job_title=request.job_posting.job_title,
-            job_description=request.job_posting.description,
-            required_skills=", ".join(request.job_posting.required_skills),
-            preferred_qualifications=request.job_posting.preferred_qualifications or "없음",
-            candidate_name=request.resume.name,
-            introduction=request.resume.introduction or "없음",
-            careers=_format_careers(request),
-            educations=_format_educations(request),
-            skills=", ".join(request.resume.skills),
-            projects=_format_projects(request),
-            certifications=_format_certifications(request),
+        user_prompt = build_user_prompt(
+            resume=request.resume,
+            job_posting=request.job_posting,
             rag_context=rag_context,
         )
 
-        logger.info("점수 산정 LLM 호출 (application_id: %d)", request.application_id)
-        raw_response = await self._llm.generate(SCORING_SYSTEM_PROMPT, user_prompt)
+        # LLM 호출 + 파싱 실패 시 1회 재시도
+        for attempt in range(1, 3):
+            logger.info(
+                "점수 산정 LLM 호출 (application_id: %d, 시도: %d/2)",
+                request.application_id,
+                attempt,
+            )
+            raw_response = await self._llm.generate(SCORING_SYSTEM_PROMPT, user_prompt)
 
-        parsed = _parse_score_response(raw_response)
-
-        score_detail = ScoreDetail(
-            job_fit=ScoreCriteria(**parsed["job_fit"]),
-            career_consistency=ScoreCriteria(**parsed["career_consistency"]),
-            skill_match=ScoreCriteria(**parsed["skill_match"]),
-            quantitative_achievement=ScoreCriteria(**parsed["quantitative_achievement"]),
-            document_quality=ScoreCriteria(**parsed["document_quality"]),
-        )
+            try:
+                score_detail = _parse_score_response(raw_response)
+                break
+            except ValueError as e:
+                logger.error(
+                    "점수 JSON 파싱 실패 (application_id: %d, 시도: %d/2): %s",
+                    request.application_id,
+                    attempt,
+                    e,
+                )
+                if attempt == 2:
+                    raise
 
         total_score = round(
-            score_detail.job_fit.score * SCORE_WEIGHTS["job_fit"]
-            + score_detail.career_consistency.score * SCORE_WEIGHTS["career_consistency"]
-            + score_detail.skill_match.score * SCORE_WEIGHTS["skill_match"]
-            + score_detail.quantitative_achievement.score * SCORE_WEIGHTS["quantitative_achievement"]
-            + score_detail.document_quality.score * SCORE_WEIGHTS["document_quality"],
+            (
+                score_detail.job_fit.score
+                + score_detail.career_consistency.score
+                + score_detail.skill_match.score
+                + score_detail.quantitative_achievement.score
+                + score_detail.document_quality.score
+            )
+            / 5,
             1,
         )
 
-        logger.info("점수 산정 완료 (application_id: %d, 총점: %.1f)", request.application_id, total_score)
+        logger.info(
+            "점수 산정 완료 (application_id: %d, 총점: %.1f)",
+            request.application_id,
+            total_score,
+        )
         return score_detail, total_score

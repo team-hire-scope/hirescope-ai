@@ -13,13 +13,16 @@ class RAGService:
     """벡터 DB 기반 유사 문서 검색 서비스.
 
     ChromaDB가 연결되지 않은 경우 빈 컨텍스트를 반환하여 graceful fallback 처리.
+    앱 크래시 없이 RAG 없는 상태로 정상 동작한다.
     """
 
     def __init__(self, chroma_client: ChromaDBClient) -> None:
         self._client = chroma_client
 
     async def search_similar(self, query: str, top_k: int = 3) -> List[str]:
-        """쿼리와 유사한 문서를 벡터 DB에서 검색.
+        """쿼리와 유사한 문서를 벡터 DB에서 검색한다.
+
+        ChromaDB 미연결 시 빈 리스트를 반환한다 (앱 크래시 방지).
 
         Args:
             query: 검색 쿼리 텍스트 (직무명, 기술스택 등)

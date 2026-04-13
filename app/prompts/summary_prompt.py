@@ -1,48 +1,131 @@
-# 이력서 요약 시스템 프롬프트
-SUMMARY_SYSTEM_PROMPT = """당신은 채용 전문가입니다.
-주어진 이력서의 핵심 정보를 채용 담당자가 빠르게 파악할 수 있도록 간결하고 객관적으로 요약합니다.
+"""이력서 요약 프롬프트 모듈.
+
+검증 완료된 시스템 프롬프트와 유저 프롬프트 빌더를 제공한다.
+"""
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.models.request import ResumeData, JobPostingData
+
+SUMMARY_SYSTEM_PROMPT = """당신은 HR 컨설턴트입니다. 지원자의 이력서를 채용 공고(JD) 관점에서 요약합니다.
 
 ## 요약 원칙
-
-- **3~5문장**으로 핵심만 요약 (길이 엄수)
-- 지원자의 핵심 역량, 주요 경력, 대표 성과를 중심으로 작성
-- 구체적인 수치, 기술명, 회사명 등 팩트 기반으로 작성
-- 채용 담당자 관점에서 "이 사람은 ~한 사람입니다" 형태로 요약
-- 과장하거나 미화하지 말고 이력서에 명시된 사실만 기술
-
-## 요약 구조 (참고)
-1. [총 경력 연수]의 [직군] 전문가 소개
-2. 핵심 기술 스택 및 전문 영역
-3. 대표적인 프로젝트/성과 (수치 포함 시 반드시 언급)
-4. 커리어 방향성 또는 특이사항 (있는 경우)
+1. 3~5문장으로 핵심만 요약합니다.
+2. JD와의 적합성을 중심으로 강점과 약점을 균형 있게 서술합니다.
+3. 구체적인 수치나 사실을 포함하여 근거를 제시합니다.
 
 ## 출력 형식
+반드시 아래 JSON 형식으로만 응답하세요. JSON 외의 텍스트는 포함하지 마세요.
 
-순수 텍스트로 3~5문장만 출력합니다. JSON이나 마크다운 형식 없이 텍스트만 반환합니다.
-"""
+{
+  "summary": "요약 텍스트 (3~5문장)"
+}"""
 
-# 이력서 요약 유저 프롬프트 템플릿
-SUMMARY_USER_PROMPT_TEMPLATE = """다음 이력서를 3~5문장으로 요약해주세요.
+
+def _format_careers(resume: "ResumeData") -> str:
+    """경력 목록을 사람이 읽기 좋은 텍스트로 변환."""
+    if not resume.careers:
+        return "경력 없음"
+    lines = []
+    for c in resume.careers:
+        end = c.end_date or "현재"
+        lines.append(
+            f"- {c.company_name} | {c.job_title} | {c.rank} | {c.start_date} ~ {end}"
+        )
+        if c.description:
+            lines.append(f"  담당업무: {c.description}")
+        if c.achievements:
+            lines.append(f"  정량적 성과: {c.achievements}")
+    return "\n".join(lines)
+
+
+def _format_educations(resume: "ResumeData") -> str:
+    """학력 목록을 사람이 읽기 좋은 텍스트로 변환."""
+    if not resume.educations:
+        return "학력 정보 없음"
+    lines = []
+    for e in resume.educations:
+        major = f" / {e.major}" if e.major else ""
+        degree = f" ({e.degree})" if e.degree else ""
+        end = e.end_date or "재학 중"
+        lines.append(f"- {e.school_name}{major}{degree} ({e.start_date} ~ {end})")
+    return "\n".join(lines)
+
+
+def _format_skills(resume: "ResumeData") -> str:
+    """기술 스택 목록을 사람이 읽기 좋은 텍스트로 변환."""
+    if not resume.skills:
+        return "기술 정보 없음"
+    return ", ".join(
+        f"{s.skill_name} ({s.level}, {s.duration_months}개월)" for s in resume.skills
+    )
+
+
+def _format_projects(resume: "ResumeData") -> str:
+    """프로젝트 목록을 사람이 읽기 좋은 텍스트로 변환."""
+    if not resume.projects:
+        return "프로젝트 경험 없음"
+    lines = []
+    for p in resume.projects:
+        role = f" | {p.role}" if p.role else ""
+        period = f" | {p.period}" if p.period else ""
+        lines.append(f"- {p.project_name}{role}{period}")
+        if p.tech_stack:
+            lines.append(f"  사용기술: {', '.join(p.tech_stack)}")
+        if p.achievement_description:
+            lines.append(f"  성과: {p.achievement_description}")
+    return "\n".join(lines)
+
+
+def _format_certifications(resume: "ResumeData") -> str:
+    """자격증 목록을 사람이 읽기 좋은 텍스트로 변환."""
+    if not resume.certifications:
+        return "없음"
+    return ", ".join(
+        f"{c.name}({c.issuer or ''})" for c in resume.certifications
+    )
+
+
+def build_user_prompt(
+    resume: "ResumeData",
+    job_posting: "JobPostingData",
+) -> str:
+    """이력서와 JD 데이터를 받아 요약 생성용 유저 프롬프트를 생성한다.
+
+    Args:
+        resume: 이력서 데이터 모델
+        job_posting: 채용 공고 데이터 모델
+
+    Returns:
+        LLM에 전달할 유저 프롬프트 텍스트
+    """
+    return f"""아래 이력서를 채용 공고 관점에서 3~5문장으로 요약해주세요.
+
+## 채용 공고 (JD)
+
+**회사명**: {job_posting.company_name}
+**직무명**: {job_posting.job_title}
+**요구 기술 스택**: {', '.join(job_posting.required_skills) or '없음'}
+**우대 사항**: {job_posting.preferred_qualifications or '없음'}
 
 ## 이력서
 
-**지원자명**: {candidate_name}
+**지원자명**: {resume.name}
 **자기소개**:
-{introduction}
+{resume.summary or '없음'}
 
 **경력 사항**:
-{careers}
+{_format_careers(resume)}
 
 **학력**:
-{educations}
+{_format_educations(resume)}
 
-**보유 기술**: {skills}
+**보유 기술**:
+{_format_skills(resume)}
 
 **프로젝트 경험**:
-{projects}
+{_format_projects(resume)}
 
-**자격증**: {certifications}
+**자격증**: {_format_certifications(resume)}
 
-채용 담당자가 이 지원자를 한눈에 파악할 수 있도록 핵심 정보만 3~5문장으로 요약하세요.
-텍스트만 반환하고, JSON이나 마크다운 형식을 사용하지 마세요.
-"""
+JD 적합성을 중심으로 강점과 약점을 균형 있게 서술하고, JSON 형식으로만 응답해주세요."""
